@@ -16,7 +16,7 @@ operator's back office in `internal/`), or **rulebook** (a contractual duty the 
 |---|---|---|
 | Members | Banks admitted by governance, each in one tier: CREDIT or PREFUND_ONLY | chain: `MemberRegistry.admit` |
 | Member keys | Per member: a settlement wallet (holds other banks' tokens), an `issuerOps` key (pays, sets limits), and on each cross-chain messenger an issuer key (co-signs mints of its own token). No address may serve two members or two purposes | chain: `MemberRegistry`, `CrossChainMessenger.setIssuerKey` |
-| The operator | Runs the ledger's business window, cuts batches, proposes settlement plans, issues pay-in schedules, manages spoke envelopes. Holds no money and is not a counterparty to any obligation | chain: `OPERATOR_ROLE`; rulebook |
+| The operator | Runs the business window on the ledger and on every spoke, cuts batches, proposes settlement plans, issues pay-in schedules, manages spoke envelopes. Holds no money and is not a counterparty to any obligation | chain: `OPERATOR_ROLE`; rulebook |
 | The settlement listener | n independent signers that attest final rail payments and funding values | chain: `SettlementAttestor` |
 | Cross-chain attesters | Signers that attest cross-chain messages after source-chain finality | chain: `CrossChainMessenger` |
 | Guardian | A fast, restrict-only role: may suspend, restrict, freeze, pause, disable a signer or attester, lower caps and rate limits, disconnect a spoke; may never raise anything | chain: `GUARDIAN_ROLE` on each contract |
@@ -83,8 +83,9 @@ next business day's first cut expires.
 |---|---|---|
 | Time zone and calendar | US Eastern; Federal Reserve holidays | operator: `internal/calendar` |
 | Business window | From **21:00 ET** the calendar day before a business day to the **end-of-day cut at 16:30 ET** | operator sets it on chain (`setWindow`); chain enforces its effect |
-| Off-hours | Every other time, including weekends and holidays. No unsecured credit: payments only within attested RTP prefund | chain: check (2) |
-| End-of-day cut | **16:30 ET** each business day; every position taken in the window is cut and settled the same day | operator |
+| Off-hours | Every other time, including weekends and holidays. No unsecured credit: on the home chain, payments only within attested RTP prefund | chain: check (2) |
+| Spoke window | The same window on every spoke, set by the operator at the same boundaries as the home chain; a new spoke starts off-hours. Off-hours a **permissioned** spoke takes no payments and releases nothing from its queue (no prefund allowance there); a **public** spoke stays open, since its envelopes are collateral | chain: `SpokeExposureGuard.setWindow`, `OffHoursCredit`; operator sets it |
+| End-of-day cut | **16:30 ET** each business day; every position taken in the window, on the home chain or on a spoke, is cut and settled the same day (also on a day with payments only on a spoke) | operator |
 | CHIPS payment cut-off | **17:00 ET**; CHIPS runs on business days from 21:00 ET the day before | operator: rail choice |
 | CHIPS minimum time left | The operator uses CHIPS only with at least **15 minutes** left before the cut-off | operator (`MinCHIPSLeft`) |
 | Pay-in deadline | **1 hour** after the plan (`PayInWindow`), capped at 17:00 ET for CHIPS. The chain requires a deadline in the future | operator; chain: `DeadlineInPast` |
@@ -111,7 +112,7 @@ next business day's first cut expires.
 
 | Resource | Size | Form | Enforced by |
 |---|---|---|---|
-| Collateral (defaulter pays) | Sets the mandatory limits the member receives: they total at most its free collateral, up to $5M × (CREDIT members − 1); posting less lowers them. Collateral also backs public-spoke envelopes one-for-one | Central bank money in a joint account at a Federal Reserve Bank, or Treasuries with haircuts. The chain records only attested values | chain records; rulebook defines the form |
+| Collateral (defaulter pays) | Sets the mandatory limits the member receives: they total at most its free collateral, up to $5M × (CREDIT members − 1); posting less lowers them. Collateral also backs public-spoke envelopes one-for-one, and stays committed from a cut until the batch settles | Central bank money in a joint account at a Federal Reserve Bank, or Treasuries with haircuts. The chain records only attested values | chain records; rulebook defines the form |
 | Loss pool (cover-2) | At least the two largest debit caps, computed by the operator and attested (`POOL_REQUIRED`) | As above; contributions attested per member (`POOL`) | chain: `cut` reverts `PoolNotReplenished` while the pool is short |
 | RTP prefund | Each member's own choice; bounds its off-hours payments | The member's position in the RTP joint account, funded over Fedwire | chain: check (2) |
 | Attestation of values | 3 of 5 listener signatures; each signer checks its own source; the `asOf` time strictly increases per value and member; each nonce once | | chain: `attestFunding`, `CollateralRegister.attest` |
@@ -123,8 +124,9 @@ next business day's first cut expires.
 |---|---|---|
 | Event of default | A leg unpaid at the pay-in deadline | chain: `DefaultManager.declare`, callable by anyone after the deadline |
 | Consequence | The payer becomes `DEFAULTED`: it can no longer pay or receive, all limits to and from it are 0. **`DEFAULTED` is terminal**; no function reinstates it | chain |
-| Waterfall | For each unpaid remainder: (1) the defaulter's collateral; (2) the loss pool, drawn pro rata to contributions; (3) the survivors, pro rata to the elective limits each granted the defaulter, equal shares if none did | chain: `DefaultManager` |
-| Survivors | Every admitted member that is `ACTIVE` or `SUSPENDED`, other than the defaulter. The leg's own payee absorbs its share instead of paying itself | chain: `absorbLoss` |
+| Waterfall | For each unpaid remainder: (1) the defaulter's collateral, except the part committed to public-spoke positions, which stays behind them; (2) the loss pool, drawn pro rata to contributions; (3) the survivors, pro rata to the elective limits each granted the defaulter, equal shares if none did | chain: `DefaultManager` |
+| Survivors | Every admitted **CREDIT-tier** member that is `ACTIVE` or `SUSPENDED`, other than the defaulter. A PREFUND_ONLY member never shares a loss. The leg's own payee absorbs its share instead of paying itself | chain: `DefaultManager`, `absorbLoss` |
+| No eligible survivor | The leg's payee bears the rest as a recorded loss (`ShortfallAbsorbed`) | chain: `DefaultManager`, `absorbLoss` |
 | Survivor obligations | Binding; paid as fiat legs and attested like any other payment | chain records; rulebook binds |
 | Suspension elsewhere | The defaulter is suspended on every spoke | operator: `sendSuspend` |
 | Testing | Default procedures tested with members at least annually | rulebook |
@@ -135,9 +137,9 @@ next business day's first cut expires.
 |---|---|---|
 | Admission | By governance, on objective, risk-based and published criteria | chain: `admit`; rulebook: criteria |
 | CREDIT tier | Grants and receives mandatory limits; may grant elective limits; posts collateral; contributes to the pool | chain |
-| PREFUND_ONLY tier | Neither grants nor receives mandatory limits; pays only within its own free collateral; holds others' tokens only within elective limits it grants | chain |
+| PREFUND_ONLY tier | Neither grants nor receives mandatory limits; pays only within its own free collateral; holds others' tokens only within elective limits it grants; never shares another member's default loss | chain |
 | Suspension | Guardian, fast; reinstatement by governance | chain |
-| Exit | Orderly exit procedure to be drafted; the code has an `EXITED` status but no function sets it | rulebook |
+| Exit | Governance records an orderly exit once the member has no position left: no open, pending or spoke-envelope position as holder or issuer, and no queued payment. `EXITED` is terminal; the id and addresses cannot be admitted again. A defaulted member cannot exit. Winding down beforehand, and the return of collateral and pool contributions, are rulebook procedure | chain: `DefaultManager.exit` (`MemberHasPositions`), `MemberRegistry.markExited`; rulebook: wind-down |
 
 ## 11. Cross-chain
 
@@ -147,7 +149,8 @@ next business day's first cut expires.
 | Attestation | A strict majority of the attesters (deployment default 3 of 5), after source-chain finality, each reading from a node it runs itself | chain: threshold; rulebook: node rule |
 | Mint authority | Every mint needs the attesters **and** the issuing bank's own key; no key may hold both roles | chain |
 | Transports | Any carrier may deliver a signed message; none can authorize one | chain |
-| Envelopes | Spoke credit is reserved from the global limits at the hub first; public spokes take collateral envelopes only | chain |
+| Envelopes | Spoke credit is reserved from the global limits at the hub first; public spokes take collateral envelopes only, and that collateral stays committed until the position is released or settles | chain |
+| Spoke window | No credit on a permissioned spoke outside the business window (see §6) | chain; operator sets it |
 | Supply cap | Per issuer per spoke; raised only by governance, lowered by the guardian | chain |
 | Inbound mint rate limit | Per source chain and issuer, on the receiving chain; a token bucket refilling over a window (default 1 hour); unset means no mints | chain |
 | Move timeout | A mint not made by its deadline can be cancelled at the destination with the attesters' signatures; the source then unlocks | chain |

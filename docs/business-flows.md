@@ -23,6 +23,7 @@ Amounts are in US dollars. On chain they have 6 decimals (1 USD = 1_000_000).
 13. [Cutting limits: PCA, supervisory triggers, SCCL and Regulation F headroom](#13-cutting-limits-pca-supervisory-triggers-sccl-and-regulation-f-headroom)
 14. [The prefund-only tier](#14-the-prefund-only-tier)
 15. [Cross-chain flows](#15-cross-chain-flows)
+16. [Orderly exit](#16-orderly-exit)
 
 ## 1. Actors and keys
 
@@ -31,11 +32,11 @@ Amounts are in US dollars. On chain they have 6 decimals (1 USD = 1_000_000).
 | Member bank, as payer and grantor | `issuerOps` key | `pay`, `cancel` a queued payment, `requestSettlement`, set its elective limits and regulatory caps, lower its receiver cap |
 | Member bank, as holder | settlement `wallet` | Holds other banks' tokens; starts a cross-chain move of tokens it holds (`sendMint`) |
 | Member bank, as issuer | issuer key on each messenger | Co-signs every cross-chain mint of its own token |
-| The operator | `OPERATOR_ROLE` | Sets the business window and business day, cuts batches, submits plans, issues pay-in schedules, grants and releases spoke envelopes, may restrict a debtor's mandatory limits |
+| The operator | `OPERATOR_ROLE` | Sets the business window (on the home ledger and on every spoke guard) and the business day, cuts batches, submits plans, issues pay-in schedules, grants and releases spoke envelopes, may restrict a debtor's mandatory limits |
 | The settlement listener | 5 signer keys (k = 3) | Signs EIP-712 attestations of final rail payments and of funding values |
 | Cross-chain attesters | attester keys on each messenger (strict majority) | Sign cross-chain messages after source-chain finality |
 | Guardian | `GUARDIAN_ROLE` | Fast, restrict-only actions: suspend a member, restrict mandatory limits, freeze or pause tokens, disable a signer or attester, lower supply caps and rate limits, disconnect a spoke |
-| Governance | `DEFAULT_ADMIN_ROLE`, held by a `TimelockController` | Admits members, sets parameters, changes signer sets and thresholds, reinstates, raises anything |
+| Governance | `DEFAULT_ADMIN_ROLE`, held by a `TimelockController` | Admits members, sets parameters, changes signer sets and thresholds, reinstates, raises anything, runs an orderly exit (`DefaultManager.exit`) |
 | Anyone | no role | `drain` the queue, `finalize` a completed batch, `declare` a default after the deadline, deliver attested cross-chain messages, `sendBurns`, `cancelExpired` |
 
 The rails (CHIPS, RTP, and Fedwire for RTP funding) are outside the chain. The operator never holds money; the
@@ -50,7 +51,7 @@ A customer of Bank A pays a customer of Bank B $2M.
 | 1 | Bank A | `ExposureLedger.pay(to = BNKBUS30, amount, ref)` from A's `issuerOps` | (1) A and B in good standing, distinct, amount > 0 | Reverts otherwise: `NotIssuerOps`, `ZeroAmount`, `SelfPayment`, `PayerNotInGoodStanding`, `PayeeNotInGoodStanding` |
 | 2 | ledger | | (2) window: in `OFF_HOURS`, A's off-hours total plus this amount must not exceed A's attested RTP prefund | Reverts `OffHoursPrefundExceeded` otherwise |
 | 3 | ledger | | (3) B's bilateral net exposure to A after the payment ≤ `bilateralLimit(B, A)`; (4) B's net position ≤ B's receiver cap; (5) A's net debit ≤ A's debit cap | If any fails, the payment is **queued**, not rejected: `Queued(seq, reason)` with reason 3, 4 or 5 |
-| 4 | ledger | `ObligationToken(A).mint(B.wallet, amount)` | | B's wallet holds 2M A-dT. `open[A][B]` grows by 2M. The epoch hash commits to `(seq, payer, payee, amount, ref)`. `Paid(seq, A, B, amount, ref)` |
+| 4 | ledger | `ObligationToken(A).mint(B.wallet, amount)` | | B's wallet holds 2M A-dT. `open[A][B]` grows by 2M. The epoch hash commits to `(seq, payer, payee, amount, ref)` (cross-chain moves into and out of `open` are committed too, §15.5). `Paid(seq, A, B, amount, ref)` |
 | 5 | ledger | | B's net position ≥ its trigger level (default 100% of the receiver cap) | `CapReached(B)`: the operator's cut trigger (§5) |
 | 6 | Bank B | off chain | | Credits its customer. The token transfer is final: nothing on chain can reverse it |
 
@@ -109,13 +110,15 @@ sequenceDiagram
 It reverts `BatchOutstanding` while the previous batch is not finalized (one batch in flight), and
 `PoolNotReplenished` while the loss pool is below its attested requirement. The ledger moves every open position
 into `pending` for the batch and starts a new epoch; payments continue at once against the new epoch, with the
-pending amounts still counted as exposure. The operator skips a cut when the open epoch has no payments.
+pending amounts still counted as exposure. The operator skips a cut only when the open epoch's hash is empty (no
+payment and no move) and no spoke holds an open position; a day with payments only on a spoke is still cut.
 
 **Plan.** The operator nets each member's position over the batch's pending pairs and pays net debtors to net
 creditors, largest first: at most (members − 1) legs (`operator.BuildPlan`). `submitPlan(batch, legs, deadline)`
 accepts the plan only if, for every member, the legs it receives minus the legs it pays equal its net position;
 otherwise it reverts `PlanMismatch(member)`. The deadline must be in the future. A batch with no legs (all positions
-offset) completes at once.
+offset) completes at once. With spokes connected, `submitPlan` reverts `SpokesNotReported` until every spoke has
+reported its locked positions; the operator then simply waits and submits again (§15.6).
 
 **Rail and deadline.** The operator uses CHIPS while the CHIPS session is open with at least 15 minutes left before
 its 17:00 ET cut-off; the pay-in deadline is one hour after the plan, capped at 17:00 ET. Otherwise it uses RTP:
@@ -172,11 +175,11 @@ If a batch is already in flight the operator keeps the trigger and cuts as soon 
 
 | Time (ET) | Who | What |
 |---|---|---|
-| 16:30, business day | Operator | `setWindow(OFF_HOURS)` and an END_OF_DAY cut (trigger 3). From here on payments need RTP prefund (§8): no unsecured credit is taken after the cut |
+| 16:30, business day | Operator | `setWindow(OFF_HOURS)` on every spoke guard and on the home ledger, and an END_OF_DAY cut (trigger 3). From here on home payments need RTP prefund (§8) and a permissioned spoke takes no payments (§15.3): no unsecured credit is taken after the cut |
 | 16:30–17:00 | Debtors | Pay their legs over CHIPS; the deadline is 17:00 ET, the CHIPS payment cut-off |
 | by 17:00 | Listener, anyone | Attest, record, finalize: every position taken in the business window is settled the same business day |
 | after 17:00 | Anyone | If a leg is still unpaid, `DefaultManager.declare(batch)` (§12) |
-| 21:00, evening before the next business day | Operator | `setBusinessDay(yyyymmdd)` and `setWindow(BUSINESS)`; the off-hours allowance resets |
+| 21:00, evening before the next business day | Operator | `setWindow(BUSINESS)` on every spoke guard; `setBusinessDay(yyyymmdd)` and `setWindow(BUSINESS)` on the home ledger; the off-hours allowance resets |
 
 A batch still in flight at 16:30 completes first; the END_OF_DAY cut then takes everything left. Queued payments
 from the day are expired at the next business day's first cut (§3); a bank that still wants to pay them pays again,
@@ -184,8 +187,10 @@ or pays gross outside the ledger.
 
 ## 8. Off-hours and weekends: RTP within prefund
 
-Outside the business window (after 16:30 ET, weekends, Federal Reserve holidays) there is no unsecured credit. A bank
-may pay only within the RTP prefund it has placed in the RTP joint account and that the listener has attested.
+Outside the business window (after 16:30 ET, weekends, Federal Reserve holidays) there is no unsecured credit. On the
+home chain a bank may pay only within the RTP prefund it has placed in the RTP joint account and that the listener
+has attested. On a permissioned spoke it may not pay at all until the window reopens; a public spoke, whose envelopes
+are collateral, stays open (§15.3).
 
 | Step | Who | Call | Check or effect |
 |---|---|---|---|
@@ -195,7 +200,7 @@ may pay only within the RTP prefund it has placed in the RTP joint account and t
 | | Operator | cut on a trigger, plan, pay-in schedule on RTP | Legs split into payments of at most $10M; the pay-in deadline is one hour after the plan |
 | | Bank A | pays the parts on RTP | RTP is 24x7; each payment is final when it posts |
 | | Listener, anyone | attest, record, finalize | As on a weekday |
-| Sunday 21:00 (Monday a business day) | Operator | `setWindow(BUSINESS)` | The off-hours allowance resets |
+| Sunday 21:00 (Monday a business day) | Operator | `setWindow(BUSINESS)` on the spokes and at home | The off-hours allowance resets; permissioned spokes reopen |
 
 The off-hours allowance counts gross payments made in the session and is not reduced by settlements within it, so a
 bank cannot pay more than its prefund in one off-hours session even if it is also receiving. The rulebook earmarks
@@ -239,20 +244,22 @@ flowchart TD
     X --> M[Batch → DEFAULTING<br/>each unpaid payer → DEFAULTED]
     M --> C1["1. Defaulter's collateral<br/>CoverInstruction(…, COLLATERAL, x)"]
     C1 --> C2["2. Loss pool, drawn pro rata to contributions<br/>CoverInstruction(…, POOL, y)"]
-    C2 --> C3["3. Survivors, pro rata to the elective limits<br/>they granted the defaulter"]
+    C2 --> C3["3. CREDIT-tier survivors, pro rata to the elective<br/>limits they granted the defaulter"]
     C3 --> P1[Other survivors pay their share as legs]
     C3 --> P2[The leg's payee absorbs its own share<br/>absorbLoss: the remainder shrinks]
+    C2 --> C4["No eligible survivor:<br/>the payee absorbs the rest<br/>ShortfallAbsorbed"]
     P1 --> Done[All legs covered → COMPLETE → finalize]
     P2 --> Done
+    C4 --> Done
 ```
 
 | Step | Who | Call | Effect |
 |---|---|---|---|
 | 1 | Anyone (the operator does it automatically) | `DefaultManager.declare(batch)` | Reverts `NotDeclarable` unless the batch is `PLANNED` or `PARTIAL`, and `DeadlineNotPassed` until the deadline has passed. The batch becomes `DEFAULTING`. Every member that is payer of an unpaid leg becomes `DEFAULTED` |
-| 2 | DefaultManager | `CollateralRegister.drawCollateral` | For each unpaid remainder: the defaulter's attested collateral first (`CoverInstruction(batch, leg, COLLATERAL, x)`) |
+| 2 | DefaultManager | `CollateralRegister.drawCollateral` | For each unpaid remainder: the defaulter's attested collateral first, but only the part not committed to public-spoke envelopes or public-spoke pairs in a batch (`collateral − publicCommitted`); the committed part stays behind the public positions (`CoverInstruction(batch, leg, COLLATERAL, x)`) |
 | 3 | DefaultManager | `CollateralRegister.drawPool` | Then the pool, drawn from every contributor pro rata to its share (`CoverInstruction(…, POOL, y)`) |
-| 4 | DefaultManager | | Then the survivors: every admitted member that is `ACTIVE` or `SUSPENDED`, other than the defaulter, pro rata to the elective limit it granted the defaulter; equal weights if all those limits are 0; the rounding remainder to the first survivor with the largest weight. Reverts `NoSurvivors` if there are none |
-| 5 | DefaultManager | `SettlementBatches.absorbLoss` | The leg's payee is never asked to pay itself: its own share is booked as absorbed and the leg's remainder shrinks by it |
+| 4 | DefaultManager | | Then the survivors: every admitted **CREDIT-tier** member that is `ACTIVE` or `SUSPENDED`, other than the defaulter, pro rata to the elective limit it granted the defaulter; equal weights across them if all those limits are 0; the rounding remainder to the first survivor with the largest weight. A prefund-only member is never a survivor |
+| 5 | DefaultManager | `SettlementBatches.absorbLoss` | The leg's payee is never asked to pay itself: its own share is booked as absorbed and the leg's remainder shrinks by it. If there is no eligible survivor at all, the payee absorbs the whole rest as a recorded loss: `CoverInstruction` with source = the payee, and `ShortfallAbsorbed(batch, leg, payee, amount)` |
 | 6 | Operator | pay-in instructions | COLLATERAL and POOL pay from their sub-accounts of the joint account; each other survivor pays its share. Each payment is attested with `payer` = `COLLATERAL`, `POOL` or the survivor, which `recordPayment` accepts because the default manager allowed that payer for that leg |
 | 7 | Anyone | `finalize` | When every leg is covered the batch is `COMPLETE` and finalizes as usual |
 | 8 | Listener | `attestFunding(kind 1 POOL, …)` | Members replenish the pool; `cut` stays blocked until `poolTotal ≥ poolRequired` |
@@ -290,10 +297,7 @@ Smaller banks may join without taking part in mutual credit.
 | As receiver | Holds other banks' tokens only within the elective limits it grants them |
 | Off hours | Same RTP prefund rule as everyone |
 | Default | Same declaration; its collateral covers first |
-
-One rule of the current code needs attention: when no survivor granted the defaulter any elective limit, the
-survivor shares fall back to equal weights across every `ACTIVE` or `SUSPENDED` member, prefund-only members included.
-See the known limits in [design.md](design.md#6-known-limits).
+| Loss sharing | Never a survivor: a prefund-only member bears no share of another member's default, in any case. If a defaulter's remainder is left after collateral and pool and no CREDIT-tier member is eligible, the leg's payee absorbs it as a recorded loss (§12) |
 
 ## 15. Cross-chain flows
 
@@ -325,9 +329,16 @@ Credit on a spoke is a slice ("envelope") of the global limits, reserved at the 
 
 | Step | Who | Call | Check or effect |
 |---|---|---|---|
-| 1 | Bank A, its `issuerOps` on that chain | `SpokeExposureGuard.pay(to, amount, ref)` | Reverts for an unknown or suspended member, a paused token or frozen recipient |
+| 1 | Bank A, its `issuerOps` on that chain | `SpokeExposureGuard.pay(to, amount, ref)` | Reverts for an unknown or suspended member, a paused token or frozen recipient; on a **permissioned** spoke outside the business window, reverts `OffHoursCredit(payer, amount)` |
 | 2 | guard | | `used + amount ≤ env` for the pair, and the issuer's supply cap on that chain; otherwise queued locally (reason 1 envelope, 2 supply cap) |
 | 3 | guard | `RemoteObligationToken(A).mint(B.wallet, amount)` | `used[A][B]` rises. The exposure was already counted at the hub when the envelope was granted |
+
+**The spoke window.** Each spoke guard has a business window like the home ledger, set by the operator on the spoke
+(`setWindow`) at the same boundaries; a new guard starts in `OFF_HOURS`. A permissioned spoke's envelope is credit,
+so outside the window nothing is paid on it: `pay` reverts `OffHoursCredit` and `drain` mints nothing (queued
+payments wait for the window). There is no prefund allowance on a spoke. A public spoke ignores the window: its
+envelopes are the issuer's collateral. The window does not stop grants, releases, moves, cuts, burns or suspension.
+This is the scenario of `TestXChain_X6_SpokeOffHours`.
 
 ### 15.4 A DvP-like payment on a public spoke
 
@@ -336,7 +347,7 @@ spoke is backed one-for-one by the issuer's collateral.
 
 | Step | Who | What |
 |---|---|---|
-| 1 | Operator | Grants Bank A → Bank B an envelope of $20M on the public spoke; $20M of A's free collateral is committed |
+| 1 | Operator | Grants Bank A → Bank B an envelope of $20M on the public spoke; $20M of A's free collateral is committed. It stays committed until the position is released or settles (§15.6), and the public spoke takes payments at any hour |
 | 2 | Bank B's customer | Sells a bond to Bank A's customer; B's wallet escrows the bond in a DvP agent contract |
 | 3 | Bank A | Its payment key on that chain is the DvP agent. Settling the deal calls `guard.pay(B, price, ref)` and delivers the bond in the same transaction |
 | 4 | DvP agent | If the payment would queue (envelope or supply cap), the agent reverts: no delivery without payment |
@@ -353,17 +364,19 @@ passes between the holder's open position and its envelope for that spoke.
 **Home → spoke.** The holder's wallet approves the hub messenger and calls
 `HubMessenger.sendMint(issuer, holder, amount, dest, recipient, deadline)`. The hub takes the tokens into escrow
 (lock), `moveOut` turns that much of the open position into envelope for the spoke (a public spoke also commits
-collateral), and `sent[issuer][dest]` rises. The spoke checks the mint (known, not suspended, recipient = holder's
+collateral) and appends a move record to the epoch hash, and `sent[issuer][dest]` rises. The spoke checks the mint (known, not suspended, recipient = holder's
 wallet there, not blocked, within the supply cap) and, if it passes and the inbound rate limit allows, mints and
 replies `MINT_ACK`; the hub then burns the escrowed tokens. If the spoke refuses, it replies `MINT_CANCEL` and the hub
-returns the tokens and the position. If the inbound rate limit is exhausted (or was never set), the delivery reverts
-and the same message can be delivered again later; it is not cancelled.
+returns the tokens and the position (a returned-move record enters the epoch hash; a public spoke's collateral is
+released). If the inbound rate limit is exhausted (or was never set), the delivery reverts and the same message can
+be delivered again later; it is not cancelled.
 
 **Spoke → home.** The holder's wallet calls `SpokeMessenger.sendMint(…, dest = home, …)`. The guard locks the tokens
 and takes them out of the spoke's open position and envelope. The hub checks: recipient = holder's home wallet, token
 not blocked, `returned + amount ≤ sent` for that issuer and spoke (the global accountant), the spoke's envelope covers
 the amount, and, for a public spoke, that credit checks (3)–(5) hold at home. On success it mints at home through the
-ledger (`moveIn`) and replies `MINT_ACK`; the spoke burns the locked tokens. On refusal, `MINT_CANCEL` unlocks them.
+ledger (`moveIn`: a move-in record enters the epoch hash; a public spoke's collateral is released) and replies
+`MINT_ACK`; the spoke burns the locked tokens. On refusal, `MINT_CANCEL` unlocks them.
 
 **Timeout.** If a mint has not landed by its deadline, anyone may call `cancelExpired(message, attesterSigs)` on the
 destination. The nonce is marked cancelled for good (it can never mint afterwards) and `MINT_CANCEL` goes back to the
@@ -377,13 +390,16 @@ A token is never burned at the source before its mint is proven, and never minte
 |---|---|---|
 | 1 | Operator | `cut(trigger)` at home; the batch calls `HubMessenger.broadcastCut(epoch)`, which sends `CUT` to every connected spoke |
 | 2 | Each spoke | `guard.cut(epoch)`: every nonzero `used` is locked in the holder's wallet and taken out of both `used` and `env`. One `BATCH_LOCKED` per pair, then a terminator with zero ids carrying the pair count |
-| 3 | Hub | Each pair moves from the spoke's envelope into the batch's pending (`envelopeToPending`, `addRemoteToBatch`) |
-| 4 | Operator | `submitPlan` succeeds only once every connected spoke has reported in full (`SpokesNotReported` before); one plan covers home and spokes |
+| 3 | Hub | Each pair moves from the spoke's envelope into the batch's pending (`envelopeToPending`, `addRemoteToBatch`). For a public spoke the issuer's collateral stays committed (`remotePublicCommitted`) |
+| 4 | Operator | `submitPlan` succeeds only once every connected spoke has reported in full; before that it reverts `SpokesNotReported` and the operator waits and retries. One plan covers home and spokes |
 | 5 | Banks, listener | Fiat legs and attestation as on the common path: one fiat payment can settle tokens on three chains |
-| 6 | Anyone | `finalize` at home; then `HubMessenger.sendBurns(epoch)` sends one `BURN_BATCH` per spoke pair, once |
+| 6 | Anyone | `finalize` at home (which also releases the collateral held for public-spoke pairs); then `HubMessenger.sendBurns(epoch)` sends one `BURN_BATCH` per spoke pair, once |
 | 7 | Each spoke | `burnBatch` burns exactly the locked amount. Until it lands the tokens are settled-pending-burn: locked, unusable, only burnable |
 
 The cut consumes the spoke envelope: after settlement the operator grants a fresh envelope if the pair needs one.
+
+The operator cuts even when the home epoch is empty, if a spoke holds open positions (a spoke-only day,
+`TestXChain_X5_SpokeOnlyDay`), so spoke positions also settle the same business day.
 
 ### 15.7 Suspension
 
@@ -401,3 +417,17 @@ The cut consumes the spoke envelope: after settlement the operator grants a fres
 If a spoke chain or its transport fails, the guardian calls `HubMessenger.disconnectSpoke(domain)`: nothing more is
 accepted from it and it no longer holds up plans. Its envelopes stay reserved at the hub, so the loss is bounded by
 the envelopes granted to it, its supply caps and the inbound rate limit. Reconnecting is governance (`setRemote`).
+
+## 16. Orderly exit
+
+A member that wants to leave the network winds down first, then governance records the exit.
+
+| Step | Who | Call | Effect |
+|---|---|---|---|
+| 1 | The member, the operator | Ordinary flows | Stop paying, let the last batch settle, cancel or let expire any queued payment, and have the operator release every spoke envelope the member is party to |
+| 2 | Governance | `DefaultManager.exit(id)` | Reverts `MemberHasPositions(id, grossIn, grossOut, queued)` unless the member holds nothing and owes nothing at the hub: no open, pending or envelope position as holder or as issuer (gross in and gross out both 0), and no queued payment as payer or payee |
+| 3 | DefaultManager | `MemberRegistry.markExited(id)` | The member, `ACTIVE` or `SUSPENDED` (`CannotExit` otherwise), becomes `EXITED` (`Exited(id)`). `EXITED` is terminal and not good standing: it can no longer pay, receive or grant, and its id and addresses cannot be admitted again |
+| 4 | Anyone | `HubMessenger.sendSuspend(id)` | Suspends the exited member on every spoke |
+| 5 | Listener, governance | `attestFunding` | Returning the member's collateral and pool contribution is off chain; until new values are attested, its pool share still counts in the pool |
+
+A `DEFAULTED` member cannot exit: `DEFAULTED` is itself terminal.

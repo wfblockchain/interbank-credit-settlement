@@ -108,15 +108,32 @@ the invariant true between messages, since messages arrive later:
 |---|---|---|
 | Grant | Hub: `reserveEnvelope` runs the credit checks (permissioned) or commits collateral (public) and reserves | Spoke: `env` rises |
 | Release | Spoke: `release` lowers parked headroom, then unused `env` | Hub: `releaseEnvelope` lowers the reservation |
-| Spoke payment | Spoke: `used` rises within `env` | Nothing at the hub: already counted |
-| Cut | Spoke: `used` and `env` both fall by the locked amount | Hub: `envelopeToPending` moves the same amount from the envelope into the batch |
+| Spoke payment | Spoke: `used` rises within `env` (on a permissioned spoke, only in the business window, §4.1) | Nothing at the hub: already counted |
+| Cut | Spoke: `used` and `env` both fall by the locked amount | Hub: `envelopeToPending` moves the same amount from the envelope into the batch (a public spoke's collateral stays committed until settlement, §9) |
 | Suspend | Spoke: every envelope of the member is cut to `used`; the excess is parked as `releasable` | Hub: unchanged until the operator releases the parked amount |
 | Move home → spoke | Hub: open position becomes envelope (`moveOut`) | Spoke: `env` and `used` rise together (`mintIn`) |
 | Move spoke → home | Spoke: `env` and `used` fall together (`moveOut`) | Hub: envelope becomes open position (`moveIn`) |
 
-A grant that reaches a spoke for an unknown or suspended pair raises nothing: it is parked as `releasable`, and the
-operator hands it back. The cut consumes envelopes: once a pair's position settles, the operator grants a new
-envelope if the pair still needs one.
+A grant that reaches a spoke for an unknown or suspended pair raises nothing: it is parked as `releasable`
+(`GrantParked` on the spoke messenger), and the operator hands it back. The cut consumes envelopes: once a pair's
+position settles, the operator grants a new envelope if the pair still needs one.
+
+### 4.1 The spoke window
+
+The home chain allows no unsecured credit outside the business window. A permissioned spoke's envelope is credit,
+so each spoke guard carries the same window (`SpokeExposureGuard.window`, `BUSINESS = 0`, `OFF_HOURS = 1`; a new
+guard starts in `OFF_HOURS`). The operator sets it with `setWindow` (`OPERATOR_ROLE` on the spoke) at the same
+boundaries as the home ledger: `BUSINESS` from 21:00 ET the evening before a business day to the end-of-day cut at
+16:30 ET, `OFF_HOURS` otherwise (`Config.SpokeWindow` in the Go operator).
+
+| Spoke kind | In `OFF_HOURS` |
+|---|---|
+| Permissioned | `pay` reverts `OffHoursCredit(payer, amount)`; `drain` mints nothing. There is no prefund allowance on a spoke: payments wait for the window |
+| Public | Unaffected: every envelope is the issuer's collateral, so a payment there is not credit |
+
+The window gates local payments only. Grants, releases, moves in either direction, cuts, burns and suspension work at
+any hour. `TestXChain_X6_SpokeOffHours` shows a permissioned spoke refusing a payment at 16:31 ET while the public
+spoke still pays, and the permissioned spoke reopening in the next business window.
 
 ## 5. Moves: lock, then burn
 
@@ -194,7 +211,9 @@ no longer holds up plans. Its envelopes stay reserved at the hub, so the most it
 
 ## 7. Cut, lock, burn
 
-Spoke positions settle in the same batch as home positions, with one fiat payment per net leg.
+Spoke positions settle in the same batch as home positions, with one fiat payment per net leg. The operator cuts
+even when the home epoch is empty if a spoke holds open positions (`Config.OpenElsewhere`), so a day with payments
+only on a spoke still settles that day.
 
 1. `SettlementBatches.cut` calls `HubMessenger.broadcastCut(epoch)`, which sends `CUT` to every connected spoke and
    records that each was sent the cut.
@@ -206,7 +225,10 @@ Spoke positions settle in the same batch as home positions, with one fiat paymen
    the terminator has arrived and the count matches.
 4. `submitPlan` reverts `SpokesNotReported` until every connected spoke that was sent the cut has reported in full,
    and the ledger refuses to seal the batch (`RemoteUnrecorded`) while any locked amount is not yet in the pair list.
-5. The fiat legs are paid and attested as usual. `finalize` releases all exposure at the hub and burns the home pairs.
+   The Go operator treats `SpokesNotReported` as a wait, not an error, and submits the plan again once the reports
+   are in.
+5. The fiat legs are paid and attested as usual. `finalize` releases all exposure at the hub, releases the collateral
+   still committed for public-spoke pairs, and burns the home pairs.
 6. Anyone calls `HubMessenger.sendBurns(epoch)` once the batch is `COMPLETE`: one `BURN_BATCH` per spoke pair, once.
 7. Each spoke burns exactly the locked amount for that epoch and pair (`BurnMismatch` otherwise). Until then the
    tokens are **settled-pending-burn**: locked, unusable, only burnable.
@@ -224,7 +246,14 @@ new grants.
 
 On a spoke registered as `PUBLIC`, an envelope is drawn **one-for-one from the issuer's free collateral**
 (`CollateralRegister.commitPublic`), not from credit limits; a move from home to a public spoke commits collateral in
-the same way. Default credit on a public spoke is 0: with no envelope, nothing can be paid there.
+the same way. Default credit on a public spoke is 0: with no envelope, nothing can be paid there. Because nothing on
+a public spoke is credit, the spoke window (§4.1) does not apply there.
+
+**The collateral is held for as long as the exposure exists.** A release, a cancelled move or a move landing home
+frees it at once. An amount the public spoke locks at a cut keeps its collateral committed from the cut until the
+batch finalizes: the hub records it per batch and pair (`ExposureLedger.remotePublicCommitted`) and releases it in
+`clearPending`, when the pair settles. Until then the issuer cannot commit that collateral again, and the default
+waterfall's collateral step draws only collateral that is not committed to public positions.
 
 Why credit stays private:
 
@@ -267,6 +296,14 @@ operator, or a member's own process can all carry it. None can make it valid: va
 majority and, for a mint, the issuer's key, checked on the destination. A transport outage delays messages; a transport cannot
 forge them, and cannot replay them (`NonceUsed`).
 
+The model's own transport is `internal/xchain`: five attesters in the tests, each on its own connections and signing
+only up to each chain's final head; one issuer co-signer per bank, which co-signs a `MINT` of its own token only
+when its own node shows the matching lock, final, at the source; and an untrusted relayer that delivers in
+`(source, nonce)` order, skips nonces already consumed, retries a `RateLimited` delivery later and cancels an expired
+`MINT` with `cancelExpired`. `xchain.Reconcile` checks supply and envelope nesting across every chain. Six end-to-end
+tests run it on three anvil chains (home, permissioned spoke, public spoke): a cut across chains (X1), lock-then-burn
+moves (X2), faults (X3), suspension (X4), a spoke-only day (X5) and the spoke window (X6).
+
 ## 12. Incident lessons
 
 Loss figures are from the cited secondary write-ups, not from official post-mortems.
@@ -287,4 +324,6 @@ same keys or data sources that verify the message.
 
 See [design.md §6](design.md#6-known-limits): a disconnected spoke's in-flight moves and envelopes are stranded
 (bounded by its envelopes); the accountant's `sent` count only grows except on cancellation; one batch is in flight
-at a time; and the cover-2 pool requirement is attested, not computed on chain.
+at a time; the cover-2 pool requirement is attested, not computed on chain; the spoke window is a direct operator
+transaction on each spoke, so a spoke the operator cannot reach keeps its last window; and the batch's epoch hash
+covers the home chain only.

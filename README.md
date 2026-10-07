@@ -8,6 +8,18 @@ before any token is burned, and the network reaches several chains through hub-a
 It is a model for study and review, not a production system. All banks, tokens, identifiers and routing data in it
 are fictional (see [Fictional names](#fictional-names)).
 
+## Status
+
+- **Contracts:** home chain (credit, settlement, default, orderly exit) and cross-chain (hub and spoke messengers,
+  spoke exposure guard, remote tokens). 155 Foundry tests in 23 suites, unit, scenario and invariant; every invariant
+  suite passes under random seeds. Slither reports no High or Medium findings (four false positives are annotated in
+  the source).
+- **Back office (Go):** rails simulators, ISO 20022, the k-of-n listener, the operator, three-way reconciliation and
+  the cross-chain transport (`internal/xchain`: attesters, issuer co-signers, relayer, cross-chain reconciliation).
+- **End-to-end on anvil:** 6 home-chain tests (5 scenarios and a timelock deployment) and 6 three-chain tests
+  (X1–X6).
+- What the code does not do yet is listed in [design.md §6](docs/design.md#6-known-limits).
+
 ## The model
 
 Bank A's customer pays Bank B's customer. Bank A mints its own token, A-dT, into Bank B's settlement wallet. Bank B
@@ -53,11 +65,13 @@ The listener never moves money. It reads the rails' finality events, matches eac
 | Defaulter-pays collateral | The mandatory limits a bank receives total at most its own attested collateral (the EURO1 rule) | `CreditLimits.mandatory` |
 | Cover-2 loss pool | No new cut while the pool is below the attested requirement (the two largest debit caps) | `SettlementBatches.cut` (`PoolNotReplenished`) |
 | End-of-day settlement | Every position is cut at 16:30 ET on business days and settled the same day; after the cut, no unsecured credit until the next business window | `internal/operator`, `ExposureLedger` window rule |
-| Off-hours prefund rule | Outside the business window a bank may pay only within its attested RTP prefund | `ExposureLedger.pay`, check (2) |
-| No unwind | No function restores tokens or positions; a missed leg is covered by collateral, then the pool, then survivors | `SettlementBatches`, `DefaultManager` |
+| Off-hours prefund rule | Outside the business window a bank may pay on the home chain only within its attested RTP prefund | `ExposureLedger.pay`, check (2) |
+| Overnight credit closed on spokes | The operator sets the same window on every spoke; outside it a permissioned spoke takes no payments (`OffHoursCredit`) and its queue does not drain. A public spoke stays open: its envelopes are collateral | `SpokeExposureGuard.setWindow`, `internal/operator` |
+| No unwind | No function restores tokens or positions; a missed leg is covered by collateral, then the pool, then the CREDIT-tier survivors; with no eligible survivor the payee bears the rest as a recorded loss | `SettlementBatches`, `DefaultManager` |
 | k-of-n listener | 3 of 5 signers, strictly ascending, each with its own key and journal reader; a rail transaction id is usable once, forever; RTP payments over $10M and future finality times are refused | `SettlementAttestor` |
 | Two-key cross-chain mints | A mint on another chain needs a strict majority of attesters and the issuing bank's own key | `CrossChainMessenger.receiveMessage` |
 | Bounded spokes | Envelopes allocated from the global limits, a per-chain supply cap, an inbound mint rate limit (unset means closed), a global accountant at the hub, restrict-only suspension | `SpokeExposureGuard`, `HubMessenger` |
+| Public collateral held to settlement | Collateral behind a public-spoke envelope stays committed from the cut until the batch finalizes, and the default waterfall never draws it | `ExposureLedger.envelopeToPending`, `clearPending`; `DefaultManager` |
 
 ## Economics, stated plainly
 
@@ -73,8 +87,9 @@ model. Full method and tables: [docs/economics.md](docs/economics.md).
 - **Where the value lies instead.** Credit available 24x7 within prefund envelopes, with RTP settlement outside
   CHIPS hours; programmable, final-on-check token transfers (for example delivery versus payment on another chain);
   an auditable many-to-one mapping from token transfers to fiat legs (every fiat payment carries its batch's RF
-  reference, and every batch records the hash chain of the home-chain payments it settles); and reach to several chains without wrapped tokens. Whether these
-  are worth the collateral is a business question the numbers do not answer.
+  reference, and every batch records the hash chain of the home-chain payments and moves it settles); and reach to
+  several chains without wrapped tokens. Whether these are worth the collateral is a business question the numbers
+  do not answer.
 
 The flows are synthetic and uncalibrated; they show how the designs respond, not what any real network would need.
 
@@ -100,7 +115,9 @@ docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD":/w -w /w \
 ```
 
 **Go.** The end-to-end tests start anvil and deploy the compiled contracts (`contracts/out`, or `$ICS_ARTIFACTS`).
-They skip when no anvil is found. To use the anvil from the Docker image:
+They skip when no anvil is found. The home-chain tests (`TestE2E_*`, `TestDeployTimelockMode`) use one anvil; the
+cross-chain tests (`TestXChain_X1`…`X6`) start three, for the home chain, a permissioned spoke and a public spoke. To
+use the anvil from the Docker image:
 
 ```sh
 mkdir -p bin
@@ -109,6 +126,7 @@ docker cp foundry-tmp:/usr/local/bin/anvil bin/anvil
 docker rm foundry-tmp
 
 ANVIL_BIN=$PWD/bin/anvil go test ./... -count=1
+ANVIL_BIN=$PWD/bin/anvil go test ./internal/e2e -run TestXChain -count=1 -v   # the three-chain tests only
 ```
 
 **Narrated demo.** A Friday, a weekend, a Monday holiday and the next business day, with three banks, the operator
@@ -138,11 +156,11 @@ go run ./cmd/econ -h                  # parameters
 | `internal/rails` | CHIPS and RTP simulators with append-only journals and finality feeds |
 | `internal/iso20022` | pacs.008, pacs.009 and camt.054 with the ISO 11649 batch reference and the EndToEndId scheme |
 | `internal/listener` | Matching, EIP-712 signing, the k-of-n aggregator, funding attestations |
-| `internal/operator` | Business window, cut triggers, plan builder, rail choice, pay-in schedule, default path |
+| `internal/operator` | Business window (home and spokes), cut triggers, plan builder, rail choice, pay-in schedule, default path |
 | `internal/reconcile` | Three-way reconciliation (rail journals, listener log, chain) that halts new cuts on a break |
-| `internal/chain`, `internal/deploy` | Chain client and deployment of the home contracts from the Foundry artifacts |
-| `internal/xchain` | Cross-chain transport: attesters, issuer signers and an untrusted relayer (being written at the time of this README) |
-| `internal/e2e` | anvil harness and end-to-end scenarios: cap trigger over CHIPS, end of day, Saturday over RTP, faults, default |
+| `internal/chain`, `internal/deploy` | Chain client and deployment of the home and spoke contracts from the Foundry artifacts |
+| `internal/xchain` | Cross-chain transport: five attesters, each on its own connections and waiting for finality per chain; per-bank issuer co-signers; an untrusted, replay-safe relayer with rate-limit retry and deadline cancel; cross-chain reconciliation |
+| `internal/e2e` | anvil harness and end-to-end tests. Home chain: cap trigger over CHIPS, end of day, Saturday over RTP, faults, default, timelock deployment. Three chains: X1 a cut across chains, X2 lock-then-burn moves, X3 faults, X4 suspension, X5 a spoke-only day, X6 spoke off-hours |
 | `internal/econ`, `cmd/econ` | Economics simulator |
 | `cmd/operator-demo` | Narrated demo |
 
