@@ -29,6 +29,7 @@ interface IMemberRegistry {
     event Suspended(bytes32 indexed id, bytes32 reason);
     event Reinstated(bytes32 indexed id);
     event Defaulted(bytes32 indexed id);
+    event Exited(bytes32 indexed id);
 
     error ZeroId();
     error ReservedId(bytes32 id);
@@ -40,11 +41,13 @@ interface IMemberRegistry {
     error NotActive(bytes32 id);
     error NotSuspended(bytes32 id);
     error CannotDefault(bytes32 id, Status status);
+    error CannotExit(bytes32 id, Status status);
 
     function admit(bytes32 id, address wallet, address issuerOps, address token, Tier tier) external;
     function suspend(bytes32 id, bytes32 reason) external;
     function reinstate(bytes32 id) external;
     function markDefaulted(bytes32 id) external;
+    function markExited(bytes32 id) external;
 
     function member(bytes32 id) external view returns (Member memory);
     function memberOfWallet(address wallet) external view returns (bytes32);

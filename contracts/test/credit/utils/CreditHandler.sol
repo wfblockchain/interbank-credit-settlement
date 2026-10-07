@@ -112,6 +112,11 @@ contract CreditHandler is CreditFixture {
         if (!_canCut()) {
             return;
         }
+        // An empty epoch still cuts (that path is tested), but first try to
+        // put value in it, so a run cannot finalize only empty batches.
+        if (ledger.epochHash() == bytes32(0)) {
+            payWithinLimits(uint256(trigger) * 7 + calls, uint256(trigger) * 13 + 1, uint256(trigger) << 40);
+        }
         vm.prank(operator);
         batches.cut(uint8(bound(trigger, 1, 3)));
         cuts++;

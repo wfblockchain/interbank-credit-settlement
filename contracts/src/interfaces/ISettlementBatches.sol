@@ -2,6 +2,7 @@
 pragma solidity 0.8.30;
 
 import { ICrossChainHub } from "./ICrossChainHub.sol";
+import { IExposureLedger } from "./IExposureLedger.sol";
 
 /// @notice Net settlement batches (design §3.7).
 interface ISettlementBatches {
@@ -96,6 +97,7 @@ interface ISettlementBatches {
     function absorbLoss(uint64 batch, uint32 leg, bytes32 member, uint256 amount) external;
     function setCrossChain(address hub) external;
     function crossChain() external view returns (ICrossChainHub);
+    function ledger() external view returns (IExposureLedger);
 
     function rfReference(uint64 batch) external view returns (string memory);
     function batchCount() external view returns (uint64);

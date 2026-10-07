@@ -14,6 +14,8 @@ contract SpokeMessenger is CrossChainMessenger {
     ISpokeExposureGuard public immutable guard;
 
     event ReleaseSent(bytes32 indexed issuer, bytes32 indexed holder, uint256 amount);
+    /// An ENVELOPE_GRANT the guard parked as releasable (unknown or suspended pair).
+    event GrantParked(bytes32 indexed issuer, bytes32 indexed holder, uint256 amount);
 
     constructor(
         uint48 adminDelay,
@@ -86,7 +88,9 @@ contract SpokeMessenger is CrossChainMessenger {
     function _handle(Envelope memory e) internal override {
         uint8 k = e.kind;
         if (k == ENVELOPE_GRANT) {
-            guard.grant(e.member, e.counterparty, e.amount);
+            if (!guard.grant(e.member, e.counterparty, e.amount)) {
+                emit GrantParked(e.member, e.counterparty, e.amount);
+            }
         } else if (k == CUT) {
             (bytes32[] memory is_, bytes32[] memory hs, uint256[] memory amts) = guard.cut(e.epoch);
             for (uint256 n = 0; n < is_.length; n++) {

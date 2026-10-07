@@ -30,6 +30,12 @@ contract ExposureLedger is AccessControlDefaultAdminRules, IExposureLedger {
     /// moveInCheck only: the spoke's envelope at the hub does not cover the move.
     uint8 public constant R_ENVELOPE = 7;
 
+    /// Move records in the epoch commitment (design §3.5): every change to `open` enters it.
+    bytes32 public constant MOVE_RECORD = keccak256("CreditEpochMove.v1");
+    uint8 public constant MOVE_OUT = 1;
+    uint8 public constant MOVE_RETURNED = 2;
+    uint8 public constant MOVE_IN = 3;
+
     /// QueueCancelled reasons.
     uint8 public constant CANCEL_BY_PAYER = 0;
     uint8 public constant CANCEL_STANDING = 1;
@@ -57,6 +63,9 @@ contract ExposureLedger is AccessControlDefaultAdminRules, IExposureLedger {
     mapping(uint64 => mapping(bytes32 => mapping(bytes32 => uint256))) public remoteLocked;
     mapping(uint64 => mapping(bytes32 => mapping(bytes32 => uint256))) public remoteRecorded;
     mapping(uint64 => uint256) public remoteUnrecorded;
+    /// Spoke-locked amounts of the batch that came from a PUBLIC domain: their collateral stays
+    /// committed until the pair is cleared (settled), not released at the cut.
+    mapping(uint64 => mapping(bytes32 => mapping(bytes32 => uint256))) public remotePublicCommitted;
 
     Window public window = Window.OFF_HOURS;
     uint64 public businessDay;
@@ -156,6 +165,9 @@ contract ExposureLedger is AccessControlDefaultAdminRules, IExposureLedger {
             }
             e.state = QueueState.PAID;
             queueHead++;
+            // The mint goes to a member token (governance-admitted, no hooks); this entry is already
+            // PAID and the head advanced, so a re-entrant drain cannot execute it twice.
+            // slither-disable-next-line reentrancy-no-eth
             _execute(e.seq, e.payer, e.to, e.amount, e.ref);
             executed++;
         }
@@ -257,16 +269,28 @@ contract ExposureLedger is AccessControlDefaultAdminRules, IExposureLedger {
         if (end > pairs.length) {
             revert PageOutOfRange(end, pairs.length);
         }
+        clearedPairs[e] = end;
+        if (end == pairs.length) {
+            pendingEpoch = 0;
+        }
+        uint256[] memory release = new uint256[](count);
         for (uint256 k = start; k < end; k++) {
             PendingPair storage p = pairs[k];
             pending[p.issuer][p.holder] -= p.amount;
             grossIn[p.holder] -= p.amount;
             grossOut[p.issuer] -= p.amount;
+            if (p.remote) {
+                release[k - start] = _settledPublic(e, p.issuer, p.holder, p.amount);
+            }
         }
-        clearedPairs[e] = end;
+        // Interactions last: the register is the system's own contract (LEDGER_ROLE-gated).
+        for (uint256 k = 0; k < count; k++) {
+            if (release[k] != 0) {
+                register.releasePublic(pairs[start + k].issuer, release[k]);
+            }
+        }
         emit PendingCleared(e, start, count);
         if (end == pairs.length) {
-            pendingEpoch = 0;
             emit EpochSettled(e);
         }
     }
@@ -304,13 +328,14 @@ contract ExposureLedger is AccessControlDefaultAdminRules, IExposureLedger {
             } else if (reason == R_DEBIT_CAP) {
                 revert DebitCapExceeded(issuer);
             }
-        } else {
-            register.commitPublic(issuer, amount);
         }
         envelope[domain][issuer][holder] += amount;
         envelopeTotal[issuer][holder] += amount;
         grossIn[holder] += amount;
         grossOut[issuer] += amount;
+        if (kind == DomainKind.PUBLIC) {
+            register.commitPublic(issuer, amount); // reverts above the issuer's free collateral
+        }
         emit EnvelopeReserved(domain, issuer, holder, amount);
     }
 
@@ -318,13 +343,15 @@ contract ExposureLedger is AccessControlDefaultAdminRules, IExposureLedger {
         external
         onlyRole(MESSENGER_ROLE)
     {
-        _takeEnvelope(domain, issuer, holder, amount);
+        DomainKind kind = _takeEnvelope(domain, issuer, holder, amount);
         grossIn[holder] -= amount;
         grossOut[issuer] -= amount;
+        _releaseCollateral(kind, issuer, amount);
         emit EnvelopeReleased(domain, issuer, holder, amount);
     }
 
-    /// On a spoke's BATCH_LOCKED: the locked part of the envelope joins the in-flight batch.
+    /// On a spoke's BATCH_LOCKED: the locked part of the envelope joins the in-flight batch. On a
+    /// PUBLIC domain its collateral stays committed until the pair settles (clearPending).
     function envelopeToPending(uint32 domain, bytes32 issuer, bytes32 holder, uint256 amount, uint64 e)
         external
         onlyRole(MESSENGER_ROLE)
@@ -333,7 +360,9 @@ contract ExposureLedger is AccessControlDefaultAdminRules, IExposureLedger {
         if (isSealed[e]) {
             revert EpochSealed(e);
         }
-        _takeEnvelope(domain, issuer, holder, amount);
+        if (_takeEnvelope(domain, issuer, holder, amount) == DomainKind.PUBLIC) {
+            remotePublicCommitted[e][issuer][holder] += amount;
+        }
         pending[issuer][holder] += amount;
         remoteLocked[e][issuer][holder] += amount;
         remoteUnrecorded[e] += amount;
@@ -383,11 +412,12 @@ contract ExposureLedger is AccessControlDefaultAdminRules, IExposureLedger {
             revert MoveExceedsOpen(amount, o);
         }
         open[issuer][holder] = o - amount;
+        envelope[domain][issuer][holder] += amount;
+        envelopeTotal[issuer][holder] += amount;
+        _recordMove(MOVE_OUT, domain, issuer, holder, amount);
         if (kind == DomainKind.PUBLIC) {
             register.commitPublic(issuer, amount);
         }
-        envelope[domain][issuer][holder] += amount;
-        envelopeTotal[issuer][holder] += amount;
         emit MovedOut(domain, issuer, holder, amount);
     }
 
@@ -397,8 +427,10 @@ contract ExposureLedger is AccessControlDefaultAdminRules, IExposureLedger {
         external
         onlyRole(MESSENGER_ROLE)
     {
-        _takeEnvelope(domain, issuer, holder, amount);
+        DomainKind kind = _takeEnvelope(domain, issuer, holder, amount);
         _addOpen(issuer, holder, amount);
+        _recordMove(MOVE_RETURNED, domain, issuer, holder, amount);
+        _releaseCollateral(kind, issuer, amount);
         emit MoveReturned(domain, issuer, holder, amount);
     }
 
@@ -415,8 +447,10 @@ contract ExposureLedger is AccessControlDefaultAdminRules, IExposureLedger {
         if (reason != OK) {
             revert MoveRefused(reason);
         }
-        _takeEnvelope(domain, issuer, holder, amount);
+        DomainKind kind = _takeEnvelope(domain, issuer, holder, amount);
         _addOpen(issuer, holder, amount);
+        _recordMove(MOVE_IN, domain, issuer, holder, amount);
+        _releaseCollateral(kind, issuer, amount);
         IObligationToken(registry.member(issuer).token).mint(registry.member(holder).wallet, amount);
         emit MovedIn(domain, issuer, holder, amount);
     }
@@ -466,6 +500,18 @@ contract ExposureLedger is AccessControlDefaultAdminRules, IExposureLedger {
             return R_WINDOW;
         }
         return _limitCheck(payer, to, amount);
+    }
+
+    /// Queue entries still QUEUED with `m` as payer or payee (every such entry is at or after
+    /// queueHead: drain and the expiry only advance the head past entries that are no longer queued).
+    function queuedFor(bytes32 m) external view returns (uint256 count) {
+        uint256 n = _queue.length;
+        for (uint256 k = queueHead; k < n; k++) {
+            QueueEntry storage e = _entries[_queue[k]];
+            if (e.state == QueueState.QUEUED && (e.payer == m || e.to == m)) {
+                count++;
+            }
+        }
     }
 
     function offHoursUsed(bytes32 m) public view returns (uint256) {
@@ -595,8 +641,14 @@ contract ExposureLedger is AccessControlDefaultAdminRules, IExposureLedger {
         }
     }
 
-    function _takeEnvelope(uint32 domain, bytes32 issuer, bytes32 holder, uint256 amount) private {
-        DomainKind kind = domainKind[domain];
+    /// Lowers the domain's envelope (state only). The callers that end a public commitment
+    /// (release, cancelled move, move home) then call _releaseCollateral; a cut keeps it
+    /// (envelopeToPending) until the pair settles.
+    function _takeEnvelope(uint32 domain, bytes32 issuer, bytes32 holder, uint256 amount)
+        private
+        returns (DomainKind kind)
+    {
+        kind = domainKind[domain];
         if (kind == DomainKind.NONE) {
             revert UnknownDomain(domain);
         }
@@ -606,9 +658,28 @@ contract ExposureLedger is AccessControlDefaultAdminRules, IExposureLedger {
         }
         envelope[domain][issuer][holder] = env - amount;
         envelopeTotal[issuer][holder] -= amount;
+    }
+
+    function _releaseCollateral(DomainKind kind, bytes32 issuer, uint256 amount) private {
         if (kind == DomainKind.PUBLIC) {
             register.releasePublic(issuer, amount);
         }
+    }
+
+    /// The public collateral a settled remote pair releases. The pair list records no domain, so
+    /// the batch's public total per (issuer, holder) is released against its remote pairs in
+    /// order; by the last of them it is all released.
+    function _settledPublic(uint64 e, bytes32 issuer, bytes32 holder, uint256 amount) private returns (uint256 x) {
+        uint256 c = remotePublicCommitted[e][issuer][holder];
+        x = amount < c ? amount : c;
+        if (x != 0) {
+            remotePublicCommitted[e][issuer][holder] = c - x;
+        }
+    }
+
+    /// Appends a move to the epoch commitment: seven words, so never equal to a payment's six.
+    function _recordMove(uint8 kind, uint32 domain, bytes32 issuer, bytes32 holder, uint256 amount) private {
+        epochHash = keccak256(abi.encode(epochHash, MOVE_RECORD, kind, domain, issuer, holder, amount));
     }
 
     function _requireInFlight(uint64 e) private view {

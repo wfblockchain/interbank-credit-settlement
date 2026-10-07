@@ -7,6 +7,8 @@ import { IMemberRegistry } from "../interfaces/IMemberRegistry.sol";
 import { IObligationToken } from "../interfaces/IObligationToken.sol";
 import { ISettlementBatches } from "../interfaces/ISettlementBatches.sol";
 import { CrossChainMessenger } from "./CrossChainMessenger.sol";
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /// @notice The hub's messenger (design §4.3). Spokes talk only to the hub.
 ///
@@ -26,6 +28,8 @@ import { CrossChainMessenger } from "./CrossChainMessenger.sol";
 /// - Suspend: restrict-only SUSPEND to every spoke for a member not in good standing (anyone) or
 ///   on the guardian's call.
 contract HubMessenger is CrossChainMessenger, IHubMessenger {
+    using SafeERC20 for IERC20;
+
     /// MINT refusal reasons on the hub beyond the ledger's (3–5 limits, 7 envelope).
     uint8 public constant R_UNKNOWN = 10;
     uint8 public constant R_RECIPIENT = 11;
@@ -202,9 +206,9 @@ contract HubMessenger is CrossChainMessenger, IHubMessenger {
             revert NotHolderWallet(holder, wallet);
         }
         IObligationToken t = _token(issuer);
-        t.transferFrom(wallet, address(this), amount);
-        ledger.moveOut(dest, issuer, holder, amount);
         sent[issuer][dest] += amount;
+        IERC20(address(t)).safeTransferFrom(wallet, address(this), amount);
+        ledger.moveOut(dest, issuer, holder, amount);
     }
 
     function _completeMove(Move storage m) internal override {
@@ -214,7 +218,7 @@ contract HubMessenger is CrossChainMessenger, IHubMessenger {
     function _cancelMove(Move storage m) internal override {
         sent[m.issuer][m.dest] -= m.amount;
         ledger.moveCancelled(m.dest, m.issuer, m.holder, m.amount);
-        _token(m.issuer).transfer(m.wallet, m.amount);
+        IERC20(address(_token(m.issuer))).safeTransfer(m.wallet, m.amount);
     }
 
     function _mintCheck(Envelope memory e) internal view override returns (uint8) {
@@ -270,12 +274,12 @@ contract HubMessenger is CrossChainMessenger, IHubMessenger {
             if (r.closed && r.received >= r.expected) {
                 revert ReportClosed(e.epoch, e.source);
             }
-            ledger.envelopeToPending(e.source, e.member, e.counterparty, e.amount, e.epoch);
-            ledger.addRemoteToBatch(e.epoch, e.member, e.counterparty, e.amount);
+            r.received++;
             _remotePairs[e.epoch].push(
                 RemotePair({ domain: e.source, issuer: e.member, holder: e.counterparty, amount: e.amount })
             );
-            r.received++;
+            ledger.envelopeToPending(e.source, e.member, e.counterparty, e.amount, e.epoch);
+            ledger.addRemoteToBatch(e.epoch, e.member, e.counterparty, e.amount);
         }
         if (r.closed && r.received == r.expected) {
             emit SpokeReported(e.epoch, e.source, r.received);

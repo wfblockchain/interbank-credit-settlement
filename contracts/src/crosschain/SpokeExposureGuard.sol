@@ -23,6 +23,11 @@ import { ISpokeExposureGuard } from "../interfaces/ISpokeExposureGuard.sol";
 ///
 /// PERMISSIONED and PUBLIC spokes run the same mechanics; on a PUBLIC spoke every envelope was
 /// drawn from the issuer's free collateral at the hub (§4.4).
+///
+/// WINDOW. The operator sets the business window here as at home (`IExposureLedger.Window`,
+/// BUSINESS = 0, starting OFF_HOURS). On a PERMISSIONED spoke the envelope is credit, so outside
+/// the business window a local pay reverts and the queue does not drain; a PUBLIC spoke is
+/// collateral-backed and ignores the window.
 contract SpokeExposureGuard is AccessControlDefaultAdminRules, ISpokeExposureGuard {
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
     bytes32 public constant GUARDIAN_ROLE = keccak256("GUARDIAN_ROLE");
@@ -55,6 +60,7 @@ contract SpokeExposureGuard is AccessControlDefaultAdminRules, ISpokeExposureGua
     mapping(uint64 => mapping(bytes32 => mapping(bytes32 => uint256))) public locked;
     mapping(uint64 => bool) public epochLocked;
     mapping(bytes32 => uint256) public supplyCap;
+    IExposureLedger.Window public window = IExposureLedger.Window.OFF_HOURS;
 
     uint256 public nextSeq = 1;
     mapping(uint256 => QueueEntry) private _entries;
@@ -125,6 +131,12 @@ contract SpokeExposureGuard is AccessControlDefaultAdminRules, ISpokeExposureGua
         emit SupplyCapSet(issuer, cap);
     }
 
+    /// The business window, set by the operator at each boundary as on the home ledger.
+    function setWindow(IExposureLedger.Window w) external onlyRole(OPERATOR_ROLE) {
+        window = w;
+        emit WindowSet(w);
+    }
+
     /// Lifting a suspension is governance; envelopes come back only by new grants.
     function reinstate(bytes32 id) external onlyRole(DEFAULT_ADMIN_ROLE) {
         Member storage m = _member(id);
@@ -159,6 +171,9 @@ contract SpokeExposureGuard is AccessControlDefaultAdminRules, ISpokeExposureGua
         if (_blocked(p.token, r.wallet)) {
             revert TokenBlocked(payer, r.wallet);
         }
+        if (_offHoursCredit()) {
+            revert OffHoursCredit(payer, amount);
+        }
         seq = nextSeq++;
         uint8 reason = _check(payer, to, amount);
         if (reason != OK) {
@@ -181,6 +196,9 @@ contract SpokeExposureGuard is AccessControlDefaultAdminRules, ISpokeExposureGua
     /// FIFO from the head; stops at the first entry that still fails; cancels entries whose payer
     /// or payee is suspended. Anyone may call.
     function drain(uint256 max) external returns (uint256 executed) {
+        if (_offHoursCredit()) {
+            return 0; // no credit minted on a permissioned spoke outside the business window
+        }
         uint256 n = _queue.length;
         for (uint256 processed = 0; queueHead < n && processed < max; processed++) {
             QueueEntry storage e = _entries[_queue[queueHead]];
@@ -201,6 +219,9 @@ contract SpokeExposureGuard is AccessControlDefaultAdminRules, ISpokeExposureGua
             }
             e.state = QueueState.PAID;
             queueHead++;
+            // The mint goes to a member's remote token (governance-set, no hooks); this entry is
+            // already PAID and the head advanced, so a re-entrant drain cannot execute it twice.
+            // slither-disable-next-line reentrancy-no-eth
             _execute(e.seq, e.payer, e.to, e.amount, e.ref);
             executed++;
         }
@@ -341,7 +362,6 @@ contract SpokeExposureGuard is AccessControlDefaultAdminRules, ISpokeExposureGua
                 env[i][h] -= u;
                 locked[epoch][i][h] = u;
                 lockedTotal[i][h] += u;
-                IRemoteObligationToken(_members[i].token).lock(_members[h].wallet, u);
                 issuers[count] = i;
                 holders[count] = h;
                 amounts[count] = u;
@@ -353,6 +373,10 @@ contract SpokeExposureGuard is AccessControlDefaultAdminRules, ISpokeExposureGua
             mstore(issuers, count)
             mstore(holders, count)
             mstore(amounts, count)
+        }
+        // Interactions after every effect: lock the tokens in the holders' wallets.
+        for (uint256 k = 0; k < count; k++) {
+            IRemoteObligationToken(_members[issuers[k]].token).lock(_members[holders[k]].wallet, amounts[k]);
         }
         emit EpochLocked(epoch, count);
     }
@@ -466,6 +490,11 @@ contract SpokeExposureGuard is AccessControlDefaultAdminRules, ISpokeExposureGua
             return R_SUPPLY_CAP;
         }
         return OK;
+    }
+
+    /// Check (2) of the home ledger on this spoke: no unsecured credit outside the business window.
+    function _offHoursCredit() private view returns (bool) {
+        return KIND == IExposureLedger.DomainKind.PERMISSIONED && window == IExposureLedger.Window.OFF_HOURS;
     }
 
     function _blocked(address token, address wallet) private view returns (bool) {

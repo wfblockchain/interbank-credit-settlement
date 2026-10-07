@@ -85,7 +85,8 @@ contract DefaultManagerTest is CreditFixture {
         assertEq(batches.leg(b, 0).paid, 5 * MN);
     }
 
-    function test_declare_noSurvivors() public {
+    /// No eligible survivor: the payee bears the shortfall as a recorded loss; declare never sticks.
+    function test_declare_noSurvivors_payeeAbsorbs() public {
         _pay(A, B, 10 * MN);
         _fund(ICollateralRegister.Kind.COLLATERAL, A, 0);
         uint64 b = _cut(1);
@@ -97,8 +98,11 @@ contract DefaultManagerTest is CreditFixture {
         vm.prank(address(dm));
         registry.markDefaulted(B);
         vm.warp(batches.batch(b).deadline + 1);
-        vm.expectRevert(abi.encodeWithSelector(IDefaultManager.NoSurvivors.selector, b, 0));
+        vm.expectEmit(address(dm));
+        emit IDefaultManager.CoverInstruction(b, 0, B, 10 * MN);
         dm.declare(b);
+        assertEq(dm.absorbed(b, B), 10 * MN);
+        assertEq(uint8(batches.status(b)), uint8(ISettlementBatches.Status.COMPLETE));
     }
 
     function test_declare_twoDefaulters_survivorsExcludeBoth() public {

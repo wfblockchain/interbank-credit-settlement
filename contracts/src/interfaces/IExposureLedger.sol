@@ -139,6 +139,10 @@ interface IExposureLedger {
     function window() external view returns (Window);
     function domainKind(uint32 domain) external view returns (DomainKind);
     function offHoursUsed(bytes32 member) external view returns (uint256);
+    function grossIn(bytes32 member) external view returns (uint256);
+    function grossOut(bytes32 member) external view returns (uint256);
+    function queuedFor(bytes32 member) external view returns (uint256 count);
+    function remotePublicCommitted(uint64 epoch, bytes32 issuer, bytes32 holder) external view returns (uint256);
     function pendingPairs(uint64 epoch)
         external
         view

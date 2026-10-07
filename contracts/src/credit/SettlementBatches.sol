@@ -76,6 +76,8 @@ contract SettlementBatches is AccessControlDefaultAdminRules, ISettlementBatches
         if (total < required) {
             revert PoolNotReplenished(total, required);
         }
+        // The ledger is this system's immutable, BATCHES_ROLE-gated contract; cut is OPERATOR-only.
+        // slither-disable-next-line reentrancy-no-eth
         (bytes32 hash, uint64 e) = ledger.snapshotForCut();
         b = ++batchCount;
         Batch storage bt = _batches[b];

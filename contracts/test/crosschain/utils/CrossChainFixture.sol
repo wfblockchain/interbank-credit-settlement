@@ -66,6 +66,12 @@ abstract contract CrossChainFixture is CreditFixture {
             }
         }
         vm.stopPrank();
+        // A spoke guard starts OFF_HOURS like the home ledger; the tests run in the business window.
+        vm.startPrank(operator);
+        for (uint256 k = 0; k < 2; k++) {
+            guardOf[spokeDomains[k]].setWindow(IExposureLedger.Window.BUSINESS);
+        }
+        vm.stopPrank();
         vm.recordLogs();
     }
 

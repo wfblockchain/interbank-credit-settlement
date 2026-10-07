@@ -608,6 +608,22 @@ contract CrossChainHandler is CrossChainFixture {
         return total == 0;
     }
 
+    /// Every change to home `open` enters the epoch commitment: a nonzero open position implies a
+    /// nonzero epochHash, so the operator never skips an epoch that holds positions.
+    function openImpliesEpochHash() external view returns (bool) {
+        if (ledger.epochHash() != bytes32(0)) {
+            return true;
+        }
+        for (uint256 a = 0; a < 3; a++) {
+            for (uint256 b = 0; b < 3; b++) {
+                if (ledger.open(banks[a], banks[b]) != 0) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     /// Invariant 4: no move both minted and cancelled; a cancelled destination nonce never mints;
     /// a source settles a move only the way its destination decided.
     function movesExclusive() external view returns (bool) {

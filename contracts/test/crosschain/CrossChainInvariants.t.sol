@@ -97,6 +97,11 @@ contract CrossChainInvariantsTest is StdInvariant, Test {
         assertEq(h.publicCollateralViolations(), 0, "public envelope above free collateral");
     }
 
+    /// 7. A nonzero home open position implies a nonzero epoch commitment (moves included).
+    function invariant_7_openCommitted() public view {
+        assertTrue(h.openImpliesEpochHash(), "open position outside the epoch commitment");
+    }
+
     function afterInvariant() external {
         console2.log(
             string.concat(

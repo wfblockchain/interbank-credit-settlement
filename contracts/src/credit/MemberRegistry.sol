@@ -101,6 +101,20 @@ contract MemberRegistry is AccessControlDefaultAdminRules, IMemberRegistry {
         emit Defaulted(id);
     }
 
+    /// Orderly exit, through DefaultManager.exit (governance, after its no-position check).
+    /// EXITED is terminal: nothing leaves it, and it is not good standing.
+    function markExited(bytes32 id) external onlyRole(DEFAULT_MANAGER_ROLE) {
+        Status s = _members[id].status;
+        if (s != Status.ACTIVE && s != Status.SUSPENDED) {
+            revert CannotExit(id, s);
+        }
+        if (s == Status.ACTIVE) {
+            _countActive(id, false);
+        }
+        _members[id].status = Status.EXITED;
+        emit Exited(id);
+    }
+
     function member(bytes32 id) external view returns (Member memory) {
         return _members[id];
     }

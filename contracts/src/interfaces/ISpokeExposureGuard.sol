@@ -53,6 +53,7 @@ interface ISpokeExposureGuard {
     event PairBurned(uint64 indexed epoch, bytes32 indexed issuer, bytes32 indexed holder, uint256 amount);
     event Suspended(bytes32 indexed id);
     event Reinstated(bytes32 indexed id);
+    event WindowSet(IExposureLedger.Window window);
 
     error ZeroAddress();
     error ZeroAmount();
@@ -74,12 +75,15 @@ interface ISpokeExposureGuard {
     error BurnMismatch(uint64 epoch, bytes32 issuer, bytes32 holder, uint256 amount, uint256 locked);
     error MintRefused(uint8 reason);
     error NotALowering(uint256 current, uint256 requested);
+    /// A local pay on a PERMISSIONED spoke outside the business window (home check (2)).
+    error OffHoursCredit(bytes32 payer, uint256 amount);
 
     // Members and caps.
     function setMember(bytes32 id, address wallet, address issuerOps, address token) external;
     function setSupplyCap(bytes32 issuer, uint256 cap) external;
     function lowerSupplyCap(bytes32 issuer, uint256 cap) external;
     function reinstate(bytes32 id) external;
+    function setWindow(IExposureLedger.Window window) external;
 
     // Local payments.
     function pay(bytes32 to, uint256 amount, bytes32 ref) external returns (uint256 seq);
@@ -102,6 +106,7 @@ interface ISpokeExposureGuard {
     // Views.
     function DOMAIN() external view returns (uint32);
     function KIND() external view returns (IExposureLedger.DomainKind);
+    function window() external view returns (IExposureLedger.Window);
     function mintCheck(bytes32 issuer, bytes32 holder, address recipient, uint256 amount)
         external
         view

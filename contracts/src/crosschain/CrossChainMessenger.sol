@@ -420,8 +420,10 @@ abstract contract CrossChainMessenger is AccessControlDefaultAdminRules, ICrossC
         if (key == address(0)) {
             revert IssuerKeyNotSet(member);
         }
-        (address signer,,) = ECDSA.tryRecover(digest, sig);
-        if (signer != key) {
+        // Every error is a rejection; the third value only says why a signature is malformed.
+        // slither-disable-next-line unused-return
+        (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, sig);
+        if (err != ECDSA.RecoverError.NoError || signer != key) {
             revert BadIssuerSignature(member, signer);
         }
     }

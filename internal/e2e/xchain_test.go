@@ -205,6 +205,14 @@ func newXWorld(t *testing.T, start time.Time, o xOptions) *xWorld {
 	if o.AttesterDial != nil {
 		dial = func(i int) xchain.DialFunc { return o.AttesterDial(i, x) }
 	}
+	w.Op.SetSpokeWindow(func(ctx context.Context, window uint8) error {
+		for _, d := range []uint32{domPerm, domPub} {
+			if _, err := x.send(d, x.Spokes[d].Guard, w.Operator, "setWindow", window); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 	w.Op.SetOpenElsewhere(func(ctx context.Context) (bool, error) {
 		for _, d := range []uint32{domPerm, domPub} {
 			for _, i := range bankSpecs {
@@ -1142,4 +1150,32 @@ func TestXChain_X5_SpokeOnlyDay(t *testing.T) {
 	x.relay()
 	x.eq("permissioned A-dT supply after the burn", x.big(domPerm, x.rtok(domPerm, "A"), "totalSupply"), 0)
 	x.Log("spoke-only day settled the same business day; A-dT burned on the permissioned spoke")
+}
+
+// ---------------------------------------------------------------- X6
+
+// X6. No unsecured credit overnight on a spoke: after the end-of-day cut the
+// operator moves every spoke to OFF_HOURS; a credit payment on the
+// permissioned spoke is refused, while the public spoke (collateral-backed)
+// keeps working. The next business window reopens the permissioned spoke.
+func TestXChain_X6_SpokeOffHours(t *testing.T) {
+	day := Date("2026-10-06")
+	x := newXWorld(t, At(day, 9, 0), xOptions{})
+	must(t, x.AdvanceTo(At(day, 10, 0)))
+	x.grant(domPerm, "A", "B", 10*M)
+	x.grant(domPub, "A", "B", 5*M)
+	x.relay()
+	x.mustSpokePay(domPerm, "A", "B", 1*M)
+	must(t, x.AdvanceTo(At(day, 16, 29)))
+	x.Clock.Set(At(day, 16, 31))
+	must(t, x.Step())
+	_, _, err := x.spokePay(domPerm, "A", "B", 1*M)
+	requireErr(t, err, "OffHoursCredit")
+	x.Log("16:31 ET: permissioned spoke refuses credit off-hours (OffHoursCredit)")
+	x.mustSpokePay(domPub, "A", "B", 1*M)
+	x.Log("public spoke still pays: its envelope is covered by Bank A's collateral")
+	must(t, x.AdvanceTo(At(Date("2026-10-07"), 9, 0)))
+	x.relay()
+	x.mustSpokePay(domPerm, "A", "B", 1*M)
+	x.Log("next business window: the permissioned spoke reopens")
 }

@@ -43,7 +43,11 @@ type Config struct {
 	// the current epoch (nil: no spokes). A cut is skipped only when neither
 	// the home epoch nor any spoke has anything to settle.
 	OpenElsewhere func(ctx context.Context) (bool, error)
-	Log           func(format string, args ...any)
+	// SpokeWindow applies the business window to every spoke guard, at the
+	// same boundaries as the home ledger (nil: no spokes). A permissioned
+	// spoke refuses credit payments while OFF_HOURS.
+	SpokeWindow func(ctx context.Context, window uint8) error
+	Log         func(format string, args ...any)
 }
 
 // BatchRecord is the operator's record of one batch, for narration and the
@@ -97,11 +101,18 @@ type Operator struct {
 	lastRefusal error
 	nextPart    map[[2]uint64]uint32
 	waitingFor  uint64 // batch whose plan waits for spoke reports (logged once)
+	spokeWin    int    // window last applied to the spokes; -1 none yet
 }
 
 // errSpokesPending: the chain refused the plan because a spoke has not yet
 // reported its locked positions; the operator waits and retries.
 var errSpokesPending = errors.New("waiting for spoke reports")
+
+// SetSpokeWindow installs the spoke window hook after construction; the next
+// Tick applies the current window to the spokes.
+func (o *Operator) SetSpokeWindow(f func(ctx context.Context, window uint8) error) {
+	o.cfg.SpokeWindow, o.spokeWin = f, -1
+}
 
 // SetOpenElsewhere installs the spoke check after construction.
 func (o *Operator) SetOpenElsewhere(f func(ctx context.Context) (bool, error)) {
@@ -125,7 +136,7 @@ func New(cfg Config) *Operator {
 	if cfg.Log == nil {
 		cfg.Log = func(string, ...any) {}
 	}
-	return &Operator{cfg: cfg, d: cfg.Deployment, eodDone: map[string]bool{}, nextPart: map[[2]uint64]uint32{}}
+	return &Operator{cfg: cfg, d: cfg.Deployment, eodDone: map[string]bool{}, nextPart: map[[2]uint64]uint32{}, spokeWin: -1}
 }
 
 func (o *Operator) log(format string, args ...any) { o.cfg.Log("operator: "+format, args...) }
@@ -220,8 +231,17 @@ func (o *Operator) setWindow(ctx context.Context, now time.Time) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	spokes := false
+	if o.cfg.SpokeWindow != nil && o.spokeWin != int(want) {
+		if err := o.cfg.SpokeWindow(ctx, want); err != nil {
+			return false, err
+		}
+		o.spokeWin = int(want)
+		spokes = true
+		o.log("spokes: window → %s", map[uint8]string{deploy.WindowBusiness: "BUSINESS", deploy.WindowOffHours: "OFF_HOURS"}[want])
+	}
 	if cur == want {
-		return false, nil
+		return spokes, nil
 	}
 	if want == deploy.WindowBusiness {
 		bd := uint64(day.Year()*10000 + int(day.Month())*100 + day.Day())
