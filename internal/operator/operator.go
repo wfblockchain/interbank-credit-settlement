@@ -39,7 +39,11 @@ type Config struct {
 	// Reconcile runs after every finalized batch and on Operator.Reconcile;
 	// an error halts new cuts.
 	Reconcile func(ctx context.Context) error
-	Log       func(format string, args ...any)
+	// OpenElsewhere reports whether any spoke chain holds open positions in
+	// the current epoch (nil: no spokes). A cut is skipped only when neither
+	// the home epoch nor any spoke has anything to settle.
+	OpenElsewhere func(ctx context.Context) (bool, error)
+	Log           func(format string, args ...any)
 }
 
 // BatchRecord is the operator's record of one batch, for narration and the
@@ -92,6 +96,16 @@ type Operator struct {
 	halted      error
 	lastRefusal error
 	nextPart    map[[2]uint64]uint32
+	waitingFor  uint64 // batch whose plan waits for spoke reports (logged once)
+}
+
+// errSpokesPending: the chain refused the plan because a spoke has not yet
+// reported its locked positions; the operator waits and retries.
+var errSpokesPending = errors.New("waiting for spoke reports")
+
+// SetOpenElsewhere installs the spoke check after construction.
+func (o *Operator) SetOpenElsewhere(f func(ctx context.Context) (bool, error)) {
+	o.cfg.OpenElsewhere = f
 }
 
 // New creates an operator.
@@ -280,7 +294,13 @@ func (o *Operator) step(ctx context.Context, now time.Time) (bool, error) {
 	}
 	switch bt.Status {
 	case deploy.StatusCut:
-		return true, o.plan(ctx, now, r, bt)
+		if err := o.plan(ctx, now, r, bt); err != nil {
+			if errors.Is(err, errSpokesPending) {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
 	case deploy.StatusPlanned, deploy.StatusPartial:
 		if !r.instructed {
 			r.instructed = true
@@ -320,7 +340,13 @@ func (o *Operator) maybeCut(ctx context.Context, now time.Time) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if eh == ([32]byte{}) {
+	elsewhere := false
+	if eh == ([32]byte{}) && o.cfg.OpenElsewhere != nil {
+		if elsewhere, err = o.cfg.OpenElsewhere(ctx); err != nil {
+			return false, err
+		}
+	}
+	if eh == ([32]byte{}) && !elsewhere {
 		o.log("%s cut skipped: no payments in the open epoch", deploy.TriggerName(t.kind))
 		o.triggers = nil
 		return false, nil
@@ -384,6 +410,13 @@ func (o *Operator) plan(ctx context.Context, now time.Time, r *BatchRecord, bt d
 		al = append(al, abiLeg{Payer: l.Payer, Payee: l.Payee, Amount: l.Amount, Paid: new(big.Int)})
 	}
 	if _, err := o.d.Send(ctx, o.d.Batches, o.cfg.Account, "submitPlan", r.Batch, al, uint64(rc.Deadline.Unix())); err != nil {
+		if strings.Contains(err.Error(), "SpokesNotReported") {
+			if o.waitingFor != r.Batch {
+				o.waitingFor = r.Batch
+				o.log("submitPlan(batch %d) waits: not every spoke has reported its locked positions yet", r.Batch)
+			}
+			return errSpokesPending
+		}
 		return err
 	}
 	ins, err := Schedule(r.Batch, legs, rc)

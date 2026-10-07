@@ -83,7 +83,7 @@ func ValidateCreditorReference(ref string) error {
 }
 
 // BatchReference is the reference of settlement batch `batch`, as
-// SettlementBatches.reference(batch) returns it: "RF" + check digits + "CS" +
+// SettlementBatches.rfReference(batch) returns it: "RF" + check digits + "CS" +
 // the decimal batch number.
 func BatchReference(batch uint64) (string, error) {
 	return CreditorReference(BatchPrefix + strconv.FormatUint(batch, 10))
