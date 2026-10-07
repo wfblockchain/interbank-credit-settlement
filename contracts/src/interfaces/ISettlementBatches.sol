@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
+import { ICrossChainHub } from "./ICrossChainHub.sol";
+
 /// @notice Net settlement batches (design §3.7).
 interface ISettlementBatches {
     enum Status {
@@ -62,6 +64,7 @@ interface ISettlementBatches {
         uint64 indexed batch, bytes32 indexed issuer, bytes32 indexed holder, uint256 amount, bool remote
     );
     event BatchFinalized(uint64 indexed batch, uint256 burned);
+    event CrossChainSet(address hub);
 
     error InvalidTrigger(uint8 trigger);
     error BatchOutstanding(uint64 batch);
@@ -82,6 +85,7 @@ interface ISettlementBatches {
     error NotPayee(bytes32 member);
     error AlreadyFinalized(uint64 batch);
     error ZeroAddress();
+    error SpokesNotReported(uint64 epoch);
 
     function cut(uint8 trigger) external returns (uint64 batch);
     function requestSettlement() external;
@@ -90,6 +94,8 @@ interface ISettlementBatches {
     function finalize(uint64 batch, uint256 maxPairs) external returns (uint256 settled);
     function markDefaulting(uint64 batch) external;
     function absorbLoss(uint64 batch, uint32 leg, bytes32 member, uint256 amount) external;
+    function setCrossChain(address hub) external;
+    function crossChain() external view returns (ICrossChainHub);
 
     function rfReference(uint64 batch) external view returns (string memory);
     function batchCount() external view returns (uint64);

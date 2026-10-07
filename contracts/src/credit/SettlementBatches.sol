@@ -4,6 +4,7 @@ pragma solidity 0.8.30;
 import { AccessControlDefaultAdminRules } from
     "@openzeppelin/contracts/access/extensions/AccessControlDefaultAdminRules.sol";
 import { ICollateralRegister } from "../interfaces/ICollateralRegister.sol";
+import { ICrossChainHub } from "../interfaces/ICrossChainHub.sol";
 import { IDefaultManager } from "../interfaces/IDefaultManager.sol";
 import { IExposureLedger } from "../interfaces/IExposureLedger.sol";
 import { IMemberRegistry } from "../interfaces/IMemberRegistry.sol";
@@ -34,6 +35,9 @@ contract SettlementBatches is AccessControlDefaultAdminRules, ISettlementBatches
     mapping(uint64 => Leg[]) private _legs;
     mapping(uint64 => mapping(uint32 => uint256)) public overpaid;
     mapping(uint64 => mapping(uint32 => mapping(bytes32 => uint256))) public paidBy;
+
+    /// The hub messenger (design §4.3); zero while no spoke is connected.
+    ICrossChainHub public crossChain;
 
     constructor(
         uint48 adminDelay,
@@ -82,6 +86,16 @@ contract SettlementBatches is AccessControlDefaultAdminRules, ISettlementBatches
         bt.cutAt = uint64(block.timestamp);
         bt.businessDay = ledger.businessDay();
         emit BatchCut(b, e, hash);
+        if (address(crossChain) != address(0)) {
+            crossChain.broadcastCut(e);
+        }
+    }
+
+    /// Wires the hub messenger: every later cut is broadcast to the spokes and its plan waits for
+    /// their reports.
+    function setCrossChain(address hub) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        crossChain = ICrossChainHub(hub);
+        emit CrossChainSet(hub);
     }
 
     /// A receiver call: the operator answers with a cut (TRIGGER_RECEIVER_CALL).
@@ -105,6 +119,9 @@ contract SettlementBatches is AccessControlDefaultAdminRules, ISettlementBatches
         }
         if (deadline <= block.timestamp) {
             revert DeadlineInPast(deadline);
+        }
+        if (address(crossChain) != address(0) && !crossChain.spokesReported(bt.epoch)) {
+            revert SpokesNotReported(bt.epoch);
         }
         ledger.sealBatch(bt.epoch);
 

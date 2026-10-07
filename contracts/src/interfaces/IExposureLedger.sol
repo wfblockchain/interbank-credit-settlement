@@ -59,6 +59,9 @@ interface IExposureLedger {
         uint32 indexed domain, bytes32 indexed issuer, bytes32 indexed holder, uint256 amount, uint64 epoch
     );
     event RemoteAddedToBatch(uint64 indexed epoch, bytes32 indexed issuer, bytes32 indexed holder, uint256 amount);
+    event MovedOut(uint32 indexed domain, bytes32 indexed issuer, bytes32 indexed holder, uint256 amount);
+    event MoveReturned(uint32 indexed domain, bytes32 indexed issuer, bytes32 indexed holder, uint256 amount);
+    event MovedIn(uint32 indexed domain, bytes32 indexed issuer, bytes32 indexed holder, uint256 amount);
 
     error NotIssuerOps(address account);
     error ZeroAmount();
@@ -85,6 +88,8 @@ interface IExposureLedger {
     error DomainAlreadySet(uint32 domain);
     error EnvelopeUnderflow(uint256 requested, uint256 available);
     error ZeroAddress();
+    error MoveExceedsOpen(uint256 requested, uint256 open);
+    error MoveRefused(uint8 reason);
 
     // Payments and queue.
     function pay(bytes32 to, uint256 amount, bytes32 ref) external returns (uint256 seq);
@@ -107,6 +112,15 @@ interface IExposureLedger {
     function envelopeToPending(uint32 domain, bytes32 issuer, bytes32 holder, uint256 amount, uint64 epoch)
         external;
     function addRemoteToBatch(uint64 epoch, bytes32 issuer, bytes32 holder, uint256 amount) external;
+
+    // Token moves between home and a spoke (MESSENGER_ROLE).
+    function moveOut(uint32 domain, bytes32 issuer, bytes32 holder, uint256 amount) external;
+    function moveCancelled(uint32 domain, bytes32 issuer, bytes32 holder, uint256 amount) external;
+    function moveIn(uint32 domain, bytes32 issuer, bytes32 holder, uint256 amount) external;
+    function moveInCheck(uint32 domain, bytes32 issuer, bytes32 holder, uint256 amount)
+        external
+        view
+        returns (uint8 reason);
 
     // Views.
     function open(bytes32 issuer, bytes32 holder) external view returns (uint256);

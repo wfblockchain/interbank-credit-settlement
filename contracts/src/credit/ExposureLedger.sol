@@ -27,6 +27,8 @@ contract ExposureLedger is AccessControlDefaultAdminRules, IExposureLedger {
     uint8 public constant R_BILATERAL = 3;
     uint8 public constant R_RECEIVER_CAP = 4;
     uint8 public constant R_DEBIT_CAP = 5;
+    /// moveInCheck only: the spoke's envelope at the hub does not cover the move.
+    uint8 public constant R_ENVELOPE = 7;
 
     /// QueueCancelled reasons.
     uint8 public constant CANCEL_BY_PAYER = 0;
@@ -217,6 +219,9 @@ contract ExposureLedger is AccessControlDefaultAdminRules, IExposureLedger {
             bytes32 i = pairs[k][0];
             bytes32 h = pairs[k][1];
             uint256 amount = open[i][h];
+            if (amount == 0) {
+                continue; // every open token of the pair moved to a spoke
+            }
             open[i][h] = 0;
             pending[i][h] += amount;
             _pendingPairs[snapped].push(PendingPair({ issuer: i, holder: h, amount: amount, remote: false }));
@@ -357,6 +362,83 @@ contract ExposureLedger is AccessControlDefaultAdminRules, IExposureLedger {
         emit RemoteAddedToBatch(e, issuer, holder, amount);
     }
 
+    // ---------------------------------------------------------------- token moves (design §4.3)
+
+    /// Home → spoke, when the holder's tokens are locked at home: that part of the holder's open
+    /// position becomes envelope on `domain`, so gross is unchanged. On a PUBLIC domain the moved
+    /// amount draws the issuer's free collateral like a grant (§4.4).
+    function moveOut(uint32 domain, bytes32 issuer, bytes32 holder, uint256 amount)
+        external
+        onlyRole(MESSENGER_ROLE)
+    {
+        DomainKind kind = domainKind[domain];
+        if (kind == DomainKind.NONE) {
+            revert UnknownDomain(domain);
+        }
+        if (amount == 0) {
+            revert ZeroAmount();
+        }
+        uint256 o = open[issuer][holder];
+        if (amount > o) {
+            revert MoveExceedsOpen(amount, o);
+        }
+        open[issuer][holder] = o - amount;
+        if (kind == DomainKind.PUBLIC) {
+            register.commitPublic(issuer, amount);
+        }
+        envelope[domain][issuer][holder] += amount;
+        envelopeTotal[issuer][holder] += amount;
+        emit MovedOut(domain, issuer, holder, amount);
+    }
+
+    /// The destination cancelled a home → spoke move: the envelope part returns to open (gross
+    /// unchanged) and the messenger hands the locked tokens back.
+    function moveCancelled(uint32 domain, bytes32 issuer, bytes32 holder, uint256 amount)
+        external
+        onlyRole(MESSENGER_ROLE)
+    {
+        _takeEnvelope(domain, issuer, holder, amount);
+        _addOpen(issuer, holder, amount);
+        emit MoveReturned(domain, issuer, holder, amount);
+    }
+
+    /// Spoke → home: the spoke's envelope part becomes open at home (gross unchanged) and the
+    /// tokens are minted to the holder's wallet. Refused unless moveInCheck passes.
+    function moveIn(uint32 domain, bytes32 issuer, bytes32 holder, uint256 amount)
+        external
+        onlyRole(MESSENGER_ROLE)
+    {
+        if (amount == 0) {
+            revert ZeroAmount();
+        }
+        uint8 reason = moveInCheck(domain, issuer, holder, amount);
+        if (reason != OK) {
+            revert MoveRefused(reason);
+        }
+        _takeEnvelope(domain, issuer, holder, amount);
+        _addOpen(issuer, holder, amount);
+        IObligationToken(registry.member(issuer).token).mint(registry.member(holder).wallet, amount);
+        emit MovedIn(domain, issuer, holder, amount);
+    }
+
+    /// 0 if a spoke → home move of `amount` may land: the domain's envelope covers it, and when it
+    /// comes from a PUBLIC domain (collateral-covered there, credit at home) the credit checks
+    /// (3)–(5) hold for the position, which the conversion leaves unchanged in gross terms.
+    function moveInCheck(uint32 domain, bytes32 issuer, bytes32 holder, uint256 amount)
+        public
+        view
+        returns (uint8)
+    {
+        DomainKind kind = domainKind[domain];
+        if (kind == DomainKind.NONE || amount > envelope[domain][issuer][holder]) {
+            return R_ENVELOPE;
+        }
+        if (kind == DomainKind.PUBLIC) {
+            return _limitCheck(issuer, holder, 0);
+        }
+        return OK;
+    }
+
     // ---------------------------------------------------------------- views
 
     function gross(bytes32 i, bytes32 h) public view returns (uint256) {
@@ -447,6 +529,16 @@ contract ExposureLedger is AccessControlDefaultAdminRules, IExposureLedger {
         if (netPosition(to) >= _limit(limits.triggerLevel(to))) {
             emit CapReached(to);
         }
+    }
+
+    /// Adds to the current epoch's open position (moves; payments go through _execute).
+    function _addOpen(bytes32 issuer, bytes32 holder, uint256 amount) private {
+        uint64 e = epoch;
+        if (!_openSeen[e][issuer][holder]) {
+            _openSeen[e][issuer][holder] = true;
+            _openPairs[e].push([issuer, holder]);
+        }
+        open[issuer][holder] += amount;
     }
 
     /// Checks (3)–(5) with `amount` added to gross(payer, to). A prefund-only payer is covered by
