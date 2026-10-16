@@ -263,7 +263,7 @@ Why credit stays private:
 - **Containment.** A public chain is outside the members' control: its finality, its validators and its other
   applications are not governed by the rulebook. A loss on a public spoke must not become a credit loss for the
   network; with collateral envelopes the receiving bank is covered one-for-one by the issuer's own collateral.
-- **Supervisory fit.** The regulatory treatment of exposure, collateral and default in [regulatory-map.md](regulatory-map.md)
+- **Supervisory fit.** The regulatory treatment of exposure, collateral and default
   assumes a closed set of members. Keeping credit off public chains keeps that analysis intact.
 
 A public spoke still serves the main use case: delivery versus payment against assets that live there (the

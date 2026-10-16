@@ -170,7 +170,6 @@ go run ./cmd/econ -h                  # parameters
 |---|---|---|
 | [docs/business-flows.md](docs/business-flows.md) | Payments, treasury, risk | Every flow step by step: who acts, which call, which check, the effect |
 | [docs/rulebook-term-sheet.md](docs/rulebook-term-sheet.md) | Risk, legal, governance | The rules the contracts enforce and their parameters, as a term sheet |
-| [docs/regulatory-map.md](docs/regulatory-map.md) | Regulators, legal, risk | Each design choice against the PFMI, Federal Reserve policy and US law, and the open legal questions |
 | [docs/cross-chain.md](docs/cross-chain.md) | Engineers, risk | Hub and spoke, two-key mints, envelopes, lock-then-burn, bounds, incident lessons |
 | [docs/design.md](docs/design.md) | Engineers | The normative specification of the contracts and the back office, with known limits |
 | [docs/economics.md](docs/economics.md) | Everyone | Liquidity of three settlement designs on synthetic flows |

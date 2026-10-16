@@ -3,7 +3,6 @@
 **This is a term sheet, not legal drafting.** It lists, in plain terms, the rules a network rulebook would contain
 and, where the contracts enforce a rule, the contract, function and default parameter that enforce it. It is
 written to support a lawyer drafting the real rulebook; it is not that rulebook, and nothing here is legal advice.
-The regulatory reasoning behind each term, with sources, is in [regulatory-map.md](regulatory-map.md).
 
 All names are fictional (Bank A, B and C; A-dT, B-dT, C-dT). Amounts are US dollars; on chain they have 6 decimals.
 
